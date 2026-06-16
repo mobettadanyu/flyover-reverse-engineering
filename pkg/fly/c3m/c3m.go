@@ -32,10 +32,13 @@ func Parse(data []byte) (result C3M, err error) {
 }
 
 func parse(data []byte) (c3m C3M) {
-	if len(data) < 4 || data[0] != 'C' || data[1] != '3' || data[2] != 'M' {
+	if len(data) < 5 || data[0] != 'C' || data[1] != '3' || data[2] != 'M' {
 		panic("Invalid C3M header")
 	}
-	switch data[4] {
+	// The C3M version is encoded in data[3]. data[4] is a separate flag byte that
+	// Apple changed from 0x03 (pre-2021) to 0x07 in newer tiles, so it must not be
+	// used to detect the version (older code switched on data[4] and broke).
+	switch data[3] {
 	case 0x03:
 		l.Println("C3M v3")
 		c3m = parseC3Mv3(data)
@@ -149,7 +152,12 @@ func parseMaterial(data []byte, offset *int) []Material {
 			switch textureFormat {
 			case 0:
 				l.Printf("Format: JPEG")
-				materials[processedItems].JPEG = data[textureOffset : textureOffset+textureLength2]
+				materials[processedItems].Texture = data[textureOffset : textureOffset+textureLength2]
+				*offset += 16
+			case 13:
+				// Newer Flyover tiles ship textures as HEIC instead of JPEG.
+				l.Printf("Format: HEIC")
+				materials[processedItems].Texture = data[textureOffset : textureOffset+textureLength2]
 				*offset += 16
 			default:
 				panic(fmt.Sprintf("Unsupported textureFormat %d", textureFormat))
@@ -314,7 +322,9 @@ type Header struct {
 }
 
 type Material struct {
-	JPEG []byte
+	// Texture holds the raw encoded image bytes. Older tiles use JPEG, newer
+	// tiles use HEIC; callers can sniff the format from the magic bytes.
+	Texture []byte
 }
 
 type Mesh struct {

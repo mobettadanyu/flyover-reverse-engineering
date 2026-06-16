@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"runtime/debug"
 
@@ -66,7 +67,8 @@ func (e *OBJExport) Next(c3m c3m.C3M, subPfx string) (err error) {
 	dir, fnPfx := e.dir, e.fnPfx
 
 	for i, material := range c3m.Materials {
-		oth.CheckPanic(ioutil.WriteFile(path.Join(dir, fmt.Sprintf("%s%s_%d.jpg", fnPfx, subPfx, i)), material.JPEG, 0655))
+		jpgPath := path.Join(dir, fmt.Sprintf("%s%s_%d.jpg", fnPfx, subPfx, i))
+		oth.CheckPanic(writeTextureAsJPEG(jpgPath, material.Texture))
 		nxt := fmt.Sprintf(`
 newmtl mtl_%s_%d
 Kd 1.000 1.000 1.000
@@ -107,6 +109,31 @@ map_Kd %s%s_%d.jpg
 		e.vtxCount += len(mesh.Vertices)
 	}
 	return
+}
+
+// isHEIC reports whether b looks like an ISO-BMFF/HEIF (HEIC) image, which newer
+// Flyover tiles use instead of JPEG.
+func isHEIC(b []byte) bool {
+	return len(b) > 12 && string(b[4:8]) == "ftyp"
+}
+
+// writeTextureAsJPEG writes the texture to jpgPath as a JPEG. JPEG textures are
+// written verbatim; HEIC textures (newer tiles) are transcoded to JPEG with the
+// macOS `sips` tool so the resulting OBJ/MTL is viewable in standard tools.
+func writeTextureAsJPEG(jpgPath string, tex []byte) error {
+	if !isHEIC(tex) {
+		return ioutil.WriteFile(jpgPath, tex, 0655)
+	}
+	heicPath := jpgPath + ".heic"
+	if err := ioutil.WriteFile(heicPath, tex, 0655); err != nil {
+		return err
+	}
+	defer os.Remove(heicPath)
+	out, err := exec.Command("sips", "-s", "format", "jpeg", heicPath, "--out", jpgPath).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("converting HEIC texture to JPEG via sips failed: %v: %s", err, out)
+	}
+	return nil
 }
 
 func create(fn string) (*os.File, error) {

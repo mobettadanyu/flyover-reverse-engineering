@@ -1,2 +1,7 @@
 cache/
 downloaded_files/
+
+# Local configuration holds your private Apple GeoServices token — never commit it.
+config.json
+
+.DS_Store

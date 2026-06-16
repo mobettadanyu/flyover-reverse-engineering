@@ -3,19 +3,16 @@ package main
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math"
 	"net/http"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/retroplasma/flyover-reverse-engineering/pkg/fly"
 	"github.com/retroplasma/flyover-reverse-engineering/pkg/fly/c3m"
-	"github.com/retroplasma/flyover-reverse-engineering/pkg/fly/c3mm"
 	"github.com/retroplasma/flyover-reverse-engineering/pkg/fly/exp"
 	"github.com/retroplasma/flyover-reverse-engineering/pkg/mps"
 	"github.com/retroplasma/flyover-reverse-engineering/pkg/mps/config"
@@ -111,9 +108,6 @@ func main() {
 	oth.CheckPanic(err)
 	l.Println(p.Name, p.Radius, p.Lat, p.Lon)
 
-	err = os.MkdirAll(fmt.Sprintf("./cache/c3mm/%d_%d", p.Region, p.Version), 0755)
-	oth.CheckPanic(err)
-
 	exportDir := fmt.Sprintf("./downloaded_files/obj/%f-%f-%d-%d-%d", lat, lon, zoom, tryXY, tryH)
 	err = os.MkdirAll(exportDir, 0755)
 	oth.CheckPanic(err)
@@ -145,19 +139,15 @@ func main() {
 		exDone <- 1
 	}()
 
-	// loop over area and altitude
+	// Loop over the area and altitude grid. The old C3MM (style 14) octree index
+	// that used to tell us which tiles exist is no longer served by Apple, so we
+	// probe the C3M tiles (style 15) directly: a tile that has no data returns an
+	// empty body, which getTileIfPresent reports as "not present" and we skip.
 	for dx := -tryXY; dx <= tryXY; dx++ {
 		for dy := -tryXY; dy <= tryXY; dy++ {
 			for h := 0; h < int(tryH); h++ {
 				xn := x + int(dx)
 				yn := y + int(dy)
-				hasTile, err := ctx.checkTile(p, z, yn, xn, h)
-				if err != nil {
-					panic(err)
-				}
-				if !hasTile {
-					continue
-				}
 
 				// async get tile
 				sem <- 1
@@ -165,13 +155,17 @@ func main() {
 				dx, dy, h := dx, dy, h
 				go func() {
 					defer wg.Done()
-					tile, err := ctx.getTile(p, z, yn, xn, h)
+					defer func() { <-sem }()
+					tile, found, err := ctx.getTileIfPresent(p, z, yn, xn, h)
 					if err != nil {
-						panic(err)
+						l.Println("Error at", dx, dy, "h =", h, ":", err)
+						return
+					}
+					if !found {
+						return
 					}
 					l.Println("Exporting", dx, dy, "h =", h)
 					ex <- tile
-					<-sem
 				}()
 			}
 		}
@@ -182,150 +176,35 @@ func main() {
 	l.Println(xp, "exported")
 }
 
-func (ctx *context) checkTile(p fly.Trigger, z, y, x, h int) (bool, error) {
-
-	tile := c3mm.Tile{Z: z, Y: y, X: x, H: h}
-
-	c3mm0, err := ctx.getC3mm(p, 0)
-	if err != nil {
-		return false, err
-	}
-
-	smallestZ := c3mm0.RootIndex.SmallestZ
-
-	if tile.Z < smallestZ {
-		return false, errors.New("z too small")
-	}
-
-	// list of tiles from requested to lowest level of detail
-	list := make([]c3mm.Tile, 0)
-	for t := tile; t.Z >= smallestZ; t = t.ZoomedOut() {
-		list = append(list, t)
-	}
-
-	// find octree root
-	root, listIdx := c3mm.Root{}, len(list)-1
-	for ; listIdx >= 0; listIdx-- {
-		t := list[listIdx]
-		n := len(c3mm0.RootIndex.Entries)
-		idx := sort.Search(n, func(i int) bool {
-			root := c3mm0.RootIndex.Entries[i]
-			return t.Less(root.Tile) || t == root.Tile
-		})
-		if idx == n {
-			continue
-		}
-		root = c3mm0.RootIndex.Entries[idx]
-		if t != root.Tile {
-			continue
-		}
-		break
-	}
-	if listIdx < 0 {
-		return false, nil
-	}
-
-	// readOctant reads an octant from c3mm files and moves the offset
-	readOctant := func(octantOffset *int) (c3mm.Octant, error) {
-		partNum := c3mm0.FileIndex.GetPartNumber(*octantOffset)
-		c3mm1, err := ctx.getC3mm(p, partNum)
-		if err != nil {
-			return c3mm.Octant{}, err
-		}
-		return c3mm1.GetOctant(octantOffset, c3mm0.FileIndex.Entries[partNum]), nil
-	}
-
-	rootOffset := root.Offset
-	octant, err := readOctant(&rootOffset)
-	if err != nil {
-		return false, err
-	}
-
-	if list[listIdx] == tile {
-		return true, nil
-	}
-	if listIdx == 0 {
-		return false, nil
-	}
-
-	// traverse octree
-	for ; octant.Next > 0; listIdx-- {
-		zoomedInActual := list[listIdx-1]
-		zoomedInCandidates := list[listIdx].ZoomedInCandidates()
-		bits := octant.Bits
-		octantOffset := octant.Next
-		matched := false
-		for o := 0; o < 8; o++ {
-			if (bits>>(o*2))&1 != 1 {
-				continue
-			}
-			octant, err = readOctant(&octantOffset)
-			if err != nil {
-				return false, err
-			}
-			if zoomedInCandidates(o) == zoomedInActual {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			return false, nil
-		}
-		if tile == zoomedInActual {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-func (ctx *context) getTile(p fly.Trigger, z, y, x, h int) (c3m.C3M, error) {
+// getTileIfPresent fetches and parses the C3M tile at the given coordinates.
+// It returns found=false (and no error) when there is simply no tile at those
+// coordinates, which Apple signals with a 404, an empty body, or a JPEG
+// placeholder. A non-nil error is only returned for unexpected transport
+// failures so a scan over an area degrades gracefully instead of aborting.
+func (ctx *context) getTileIfPresent(p fly.Trigger, z, y, x, h int) (c3m.C3M, bool, error) {
 	yn := mth.TileCountPerAxis(z) - 1 - y // invert y
 	url := fmt.Sprintf("%s?style=%d&v=%d&region=%d&x=%d&y=%d&z=%d&h=%d",
 		ctx.URLPrefixC3m, mps.ResourceManifest_StyleConfig_C3M, p.Version, p.Region, x, yn, z, h)
 
 	data, err := ctx.get(url)
 	if err != nil {
-		return c3m.C3M{}, err
-	}
-	return c3m.Parse(data)
-}
-
-func (ctx *context) getC3mm(p fly.Trigger, part int) (c3mm.C3MM, error) {
-	if ctx.C3mms == nil || ctx.C3mms[part] == nil {
-		data, err := ctx._getC3mm(p, part)
-		if err != nil {
-			return c3mm.C3MM{}, err
+		// 404 (no such tile) and JPEG placeholders are expected during a scan.
+		if strings.Contains(err.Error(), "http status 404") || err.Error() == "received jpeg" {
+			return c3m.C3M{}, false, nil
 		}
-		if part == 0 {
-			ctx.C3mms = make([]*c3mm.C3MM, len(data.FileIndex.Entries))
-		}
-		ctx.C3mms[part] = &data
-		return data, nil
+		return c3m.C3M{}, false, err
 	}
-	return *ctx.C3mms[part], nil
-}
-
-func (ctx *context) _getC3mm(p fly.Trigger, part int) (c3mm.C3MM, error) {
-	fn := fmt.Sprintf("./cache/c3mm/%d_%d/%d", p.Region, p.Version, part)
-	file, err := ioutil.ReadFile(fn)
-	if err != nil && !os.IsNotExist(err) {
-		return c3mm.C3MM{}, err
+	// An empty 200 response means there is no tile at these coordinates.
+	if len(data) < 5 {
+		return c3m.C3M{}, false, nil
 	}
-	if err == nil {
-		return c3mm.Parse(file, part)
-	}
-	data, err := ctx.get(fmt.Sprintf("%s?style=%d&v=%d&part=%d&region=%d",
-		ctx.URLPrefixC3mm, mps.ResourceManifest_StyleConfig_C3MM_1, p.Version, part, p.Region))
+	tile, err := c3m.Parse(data)
 	if err != nil {
-		return c3mm.C3MM{}, err
+		// Unparseable payloads are treated as "no tile" but surfaced so genuine
+		// format regressions remain visible.
+		return c3m.C3M{}, false, fmt.Errorf("parse: %w", err)
 	}
-	if ioutil.WriteFile(fn+".tmp", data, 0655) != nil {
-		return c3mm.C3MM{}, err
-	}
-	if os.Rename(fn+".tmp", fn) != nil {
-		return c3mm.C3MM{}, err
-	}
-	return c3mm.Parse(data, part)
+	return tile, true, nil
 }
 
 func (ctx context) findPlace(lat, lon float64) (fly.Trigger, error) {
@@ -370,7 +249,6 @@ type context struct {
 	AltitudeManifest fly.AltitudeManifest
 	URLPrefixC3mm    string
 	URLPrefixC3m     string
-	C3mms            []*c3mm.C3MM
 }
 
 func getContext(cache mps.Cache, config config.Config) (m context, err error) {
@@ -392,6 +270,6 @@ func getContext(cache mps.Cache, config config.Config) (m context, err error) {
 		return
 	}
 
-	m = context{ctx, am, c3mmURLPrefix, c3mURLPrefix, nil}
+	m = context{ctx, am, c3mmURLPrefix, c3mURLPrefix}
 	return
 }

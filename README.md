@@ -1,144 +1,135 @@
-<img alt="header" title="Header image: 41.8902, 12.4923" width="100%" src="https://user-images.githubusercontent.com/46618410/94180911-07108600-fe9f-11ea-92d1-3d0960df4c0a.jpg">
+# flyover-reverse-engineering (2025 fork)
 
-Reverse-engineering *Flyover* (3D satellite mode) from Apple Maps. Similar work is done for Google Earth [here](https://github.com/retroplasma/earth-reverse-engineering).
+Export textured 3D models from Apple Maps **Flyover** (the 3D satellite mode) as Wavefront `.obj` files, given a latitude/longitude.
 
-#### Status
-Roughly, these parts have been figured out:
-- bootstrap of manifests
-- URL structure
-- authentication algorithm
-- map tiling and conversion from geo coordinates
-- mesh decompression (huffman tables, edgebreaker variant etc.)
-- tile lookup using octree
+This is a fork of [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering). The original work figured out Apple's manifest bootstrap, URL authentication, geo→tile math, the octree tile lookup, and the C3M mesh decompression (Huffman tables + an edgebreaker variant). All of that still holds — but Apple changed several things on the wire since the original was written, so the original code no longer produces a model out of the box. **This fork updates the pipeline to work with Apple's current data** and switches the project to Go modules.
 
-We can authenticate URLs and retrieve textured 3D models from given coordinates (latitude, longitude).
+> Research / educational / interoperability project. It talks to Apple's servers and uses Apple's data; respect Apple's terms and don't redistribute the downloaded geometry or imagery. No tokens, keys, or downloaded tiles are included in this repo.
 
-#### General
-Data is stored in map tiles. These five tile styles are used for Flyover:
+---
 
-|Type  | Purpose                                     | URL structure                                        |
-|------|---------------------------------------------|------------------------------------------------------|
-|C3M   | Texture, Mesh, Transformation(, Animation)  | 🅐(?\|&)style=15&v=⓿&region=❶&x=❷&y=❸&z=❹&h=❺    |
-|C3MM 1| Metadata                                    | 🅐(?\|&)style=14&v=⓿&part=❻&region=❶                |   
-|C3MM 2| Metadata                                    | 🅐(?\|&)style=52&v=⓿&region=❶&x=❷&y=❸&z=❹&h=❺    |   
-|DTM 1 | Terrain/Surface/Elevation                   | 🅐(?\|&)style=16&v=⓿&region=❶&x=❷&y=❸&z=❹         |
-|DTM 2 | Terrain/Surface/Elevation                   | 🅐(?\|&)style=17&v=⓿&size=❼&scale=❽&x=❷&y=❸&z=❹  |
+## What changed vs. the original
 
-- 🅐: URL prefix from resource manifest
-- ⓿: Version from resource manifest or altitude manifest using region
-- ❶: Region ID from altitude manifest
-- ❷❸❹: Map tile numbers ([tiled web map](https://en.wikipedia.org/wiki/Tiled_web_map) scheme)
-- ❺: Height/altitude index. Probably from C3MM
-- ❻: Incremental part number
-- ❼❽: Size/scale. Not sure where its values come from
+If you used the original and got nothing but errors, this is why. Apple changed four things; all are handled here:
 
-#### Resource hierarchy
-```
-ResourceManifest
-└─ AltitudeManifest
-   ├─ C3MM
-   │  └─ C3M
-   └─ DTM?
-```
-Focusing on C3M(M) for now. DTMs are images with a footer and are probably used for the [grid](https://user-images.githubusercontent.com/46618410/53483243-fdcbf700-3a78-11e9-8fc0-ad6cfa8c57cd.png) that is displayed when Maps is loading.
+| Area | Change | How this fork handles it |
+|------|--------|--------------------------|
+| **Altitude manifest** | The resource manifest no longer ships `cache_base_url`, and the standalone altitude XML URL now 404s. The tool can no longer download the altitude manifest by itself. | **You must provide the `altitude-*.xml` file locally** (see below). |
+| **Tile index (C3MM v1)** | The part-based octree metadata (`style=14`) used to decide which tiles exist is no longer served (404). | The octree lookup was removed. Tiles are now discovered by requesting the C3M mesh tiles directly and skipping empty responses. |
+| **C3M version byte** | The mesh container's version is read from `data[3]`; Apple changed the adjacent flag byte `data[4]` (`0x03` → `0x07`), which broke the old version dispatch. | Version detection now reads the correct byte. The mesh format itself is unchanged. |
+| **Textures** | Tile textures switched from JPEG to **HEIC**. | The parser accepts HEIC, and the exporter transcodes it to JPEG so the `.obj`/`.mtl` is viewable in standard tools. |
 
-#### Code
-This repository is structured as follows:
+---
 
-|Directory           | Description                  |
-|--------------------|------------------------------|
-|[cmd](./cmd)        | command line programs        |
-|[pkg](./pkg)        | most of the actual code      |
-|[proto](./proto)    | protobuf files               |
-|[scripts](./scripts)| additional scripts           |
-|[vendor](./vendor)  | dependencies                 |
+## ⚠️ The altitude file is no longer in Apple's data — you must supply it
 
-##### Setup
+Apple stopped including the altitude-manifest reference (`cache_base_url`) in the resource manifest, so this tool **cannot fetch the altitude manifest on its own anymore**. The altitude manifest is what maps a coordinate to a Flyover region/version, so it's required.
 
-Install [Go](https://golang.org/) 1.15.x and run:
+You need to provide the file yourself, once:
+
+1. On a Mac that has opened Apple Maps at least once, grab the altitude manifest from the GeoServices cache:
+   ```
+   ~/Library/Caches/GeoServices/Resources/altitude-*.xml
+   ```
+2. Copy it into this project's cache directory:
+   ```bash
+   mkdir -p cache
+   cp ~/Library/Caches/GeoServices/Resources/altitude-*.xml cache/
+   ```
+
+The tool reads the altitude manifest from `cache/` when it's present. The filename must match the one the current resource manifest references (e.g. `altitude-1426.xml`); if the names differ, the tool will tell you which file it expected — just rename your copy to match.
+
+This file is plain region data and is platform-independent: once you have it, the rest of the pipeline (fetching, meshing, texturing) needs no Mac. See **Running on Linux / Windows** below.
+
+---
+
+## Requirements
+
+- [Go](https://go.dev/) (module mode; tested with current Go)
+- A HEIC→JPEG converter for textures:
+  - macOS: `sips` (built in) — used by default
+  - Linux/Windows: ImageMagick (built with libheif), `heif-convert` (libheif), or `ffmpeg`
+- Optional: Node.js, to center/scale the output for Blender (`scripts/center_scale_obj.js`)
+
+## Setup
+
+### 1. Configuration (`config.json`)
+
 ```bash
-go get -d github.com/retroplasma/flyover-reverse-engineering/...
-cd "$(go env GOPATH)/src/github.com/retroplasma/flyover-reverse-engineering"
+cp config.example.json config.json
 ```
 
-Then edit [config.json](config.json):
-- automatically (macOS, Linux, WSL):
-  - `./scripts/get_config.sh > config.json`
-- faster (macOS Catalina or older):
-  - `./scripts/get_config_macos.sh > config.json`
-- or manually (Catalina or older):
-  - `resourceManifestURL`: from [GEOConfigStore.db/com.apple.GEO.plist](#files-on-macos) or [GeoServices](#files-on-macos) binary
-  - `tokenP1`: from [GeoServices](#files-on-macos) binary (function: `GEOURLAuthenticationGenerateURL`)
+Then fill in two values:
 
-##### Command line programs
-Here are some command line programs that use code from [pkg](./pkg):
+- `resourceManifestURL` — Apple's GeoServices resource-manifest bootstrap URL.
+- `tokenP1` — the static URL-authentication token.
 
-###### Export OBJ [<sup>[code]</sup>](./cmd/export-obj/main.go)
+Both are static values baked into Apple's `GeoServices` framework. **They are not included here** — extract them from your own system:
 
-Usage:
+- The original repo's helper scripts (`scripts/get_config.sh`, `scripts/get_config_macos.sh`) extract them from the `GeoServices` binary.
+- On recent macOS the framework binary is no longer a standalone file — it lives inside the dyld shared cache (`/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/`), where both strings can still be recovered.
+
+`config.json` is git-ignored so your token never gets committed.
+
+### 2. Altitude file
+
+See [the altitude section above](#️-the-altitude-file-is-no-longer-in-apples-data--you-must-supply-it) — copy your `altitude-*.xml` into `cache/`.
+
+## Usage
+
+Export an area to `./downloaded_files/obj/...`:
+
 ```
-go run cmd/export-obj/main.go [lat] [lon] [zoom] [tryXY] [tryH]
+go run cmd/export-obj/main.go [lat] [lon] [zoom] [tryXY] [tryH] [--parallel]
 
-Parameter   Description       Example
---------------------------------------
-lat         Latitude          34.007603
-lon         Longitude         -118.499741
-zoom        Zoom (~ 13-20)    20
-tryXY       Area scan         3
-tryH        Altitude scan     40
-```
-
-This exports Santa Monica Pier to `./downloaded_files/obj/...`:
-```
-go run cmd/export-obj/main.go 34.007603 -118.499741 20 3 40
-```
-
-Optional: Center-scale OBJ using node.js script:
-```
-node scripts/center_scale_obj.js
+  Name    Description       Example
+  ----------------------------------------
+  lat     Latitude          41.8902
+  lon     Longitude         12.4923
+  zoom    Zoom (~13–20)     20
+  tryXY   Area scan (±tiles per axis)   3
+  tryH    Altitude scan (height indices)  40
 ```
 
-In Blender (compatible tutorial [here](https://github.com/retroplasma/earth-reverse-engineering/blob/1dd24a723513d7e96f249e2c635416d4596992c4/BLENDER.md)):
+Example — the Colosseum in Rome:
 
-<img src="https://user-images.githubusercontent.com/46618410/65068957-fa06b000-d989-11e9-9091-1e71874b0b0c.png" width="300px">
-
-
-###### Authenticate URL [<sup>[code]</sup>](./cmd/auth/main.go)
-This authenticates a URL using parameters from `config.json`:
-```
-go run cmd/auth/main.go [url]
+```bash
+go run cmd/export-obj/main.go 41.8902 12.4923 20 3 40 --parallel
 ```
 
-###### Parse C3M file [<sup>[code]</sup>](./cmd/parse-c3m/main.go)
-This parses a C3M v3 file, decompresses meshes, reads JPEG textures and produces a struct that contains a textured 3d model:
-```
-go run cmd/parse-c3m/main.go [file]
+`tryXY` controls the size of the square tile grid: the grid is `(2·tryXY + 1)` tiles per side. At zoom 20 each tile is roughly ~28 m on the ground, so `tryXY=3` covers ~200 m across. `tryH` is how many height indices to probe per tile; in practice only the low indices contain data.
+
+### Output
+
+You get `exp_model.obj`, `exp_model.mtl`, and the JPEG textures. Vertices are in **ECEF** (Earth-Centered, Earth-Fixed) coordinates, so in a fresh Blender scene the model sits ~6,000 km from the origin and lies "on its side." To make it origin-centered and scaled for Blender:
+
+```bash
+node scripts/center_scale_obj.js   # writes exp_model.2.obj next to the original
 ```
 
-###### Parse C3MM file [<sup>[code]</sup>](./cmd/parse-c3mm/main.go)
-This parses a C3MM v1 file. The C3MM files in a region span octrees whose roots are indexed in the first file.
-```
-go run cmd/parse-c3mm/main.go [file] [[file_number]]
-```
+Import the `*.2.obj` and switch the viewport to **Material Preview** to see the textures. (ECEF "up" is a tilted axis, so you may still want to rotate the object level.)
 
-#### Files on macOS
-- `~/Library/Containers/com.apple.geod/Data/Library/Caches/com.apple.geod/GEOConfigStore.db`
-  - last resource manifest url
-- `~/Library/Preferences/com.apple.GEO.plist`
-  - last resource manifest url ~prior to catalina
-- `~/Library/Caches/GeoServices/Resources/altitude-*.xml`
-  - defines regions for c3m urls
-  - `altitude-*.xml` url in resource manifest
-- `~/Library/Containers/com.apple.geod/Data/Library/Caches/com.apple.geod/MapTiles/MapTiles.sqlitedb`
-  - local map tile cache
-- `/System/Library/PrivateFrameworks/GeoServices.framework/GeoServices`
-  - resource manifest base url, networking, caching, authentication
-- `/System/Library/PrivateFrameworks/VectorKit.framework/VectorKit`
-  - parsers, decoders
-- `/System/Library/PrivateFrameworks/GeoServices.framework/XPCServices/com.apple.geod.xpc`
-  - loads `GeoServices`
-- `/Applications/Maps.app/Contents/MacOS/Maps`
-  - loads `VectorKit`
+## Running on Linux / Windows
 
-#### Important
+The Go program is pure Go — authentication, manifest parsing, mesh decompression, and networking all run on any OS, and the auth is not device-bound. To run off a Mac you need three things, none of which require a Mac at run time once you have them:
+
+1. `config.json` with your two values (static; extract once).
+2. The `altitude-*.xml` file in `cache/` (copy once from a Mac).
+3. A non-`sips` HEIC→JPEG converter (ImageMagick / `heif-convert` / `ffmpeg`) — swap it in for the `sips` call in `pkg/fly/exp/obj.go`.
+
+## Project layout
+
+| Directory | Description |
+|-----------|-------------|
+| [cmd](./cmd) | command-line programs (`export-obj`, `auth`, `parse-c3m`, `parse-c3mm`) |
+| [pkg](./pkg) | the actual library code (auth, manifest, C3M/C3MM, OBJ export) |
+| [proto](./proto) | protobuf definitions |
+| [scripts](./scripts) | config extraction + OBJ center/scale helpers |
+
+## Credits
+
+Original reverse-engineering and code: [retroplasma/flyover-reverse-engineering](https://github.com/retroplasma/flyover-reverse-engineering). Related project for Google Earth: [retroplasma/earth-reverse-engineering](https://github.com/retroplasma/earth-reverse-engineering). This fork only adapts the existing pipeline to Apple's current data format.
+
+## Disclaimer
+
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
