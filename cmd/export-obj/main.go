@@ -41,6 +41,16 @@ func printUsage(msg string) {
 	os.Exit(1)
 }
 
+var scraped_regions_to_ignore []string
+func contains(slice []string, target string) bool {
+	for _, item := range slice {
+		if item == target {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 
 	var err error
@@ -103,77 +113,92 @@ func main() {
 
 	z := int(zoom)
 	x, y := mth.LatLonToTileTMS(z, lat, lon)
+	
+	for {
+		p, err := ctx.findPlace(lat, lon)
+		oth.CheckPanic(err)
+		l.Println(p.Name, p.Radius, math.Sqrt(math.Pow(p.Lat, 2) + math.Pow(p.Lon, 2)), p.Lat, p.Lon)
 
-	p, err := ctx.findPlace(lat, lon)
-	oth.CheckPanic(err)
-	l.Println(p.Name, p.Radius, p.Lat, p.Lon)
+		// add to list of already scraped regions (ignore)
+		scraped_regions_to_ignore = append(scraped_regions_to_ignore, p.Name)
 
-	exportDir := fmt.Sprintf("./downloaded_files/obj/%f-%f-%d-%d-%d", lat, lon, zoom, tryXY, tryH)
-	err = os.MkdirAll(exportDir, 0755)
-	oth.CheckPanic(err)
+		// for _, v := range ctx.AltitudeManifest.Triggers {
+		// 	dist := math.Sqrt(math.Pow(lat-v.Lat, 2) + math.Pow(lon-v.Lon, 2))
+		// 	if dist < 5 { // adjust as needed — degrees, so 5 is generous
+		// 		l.Println("nearby:", v.Name, "radius:", v.Radius, "dist:", dist)
+		// 	}
+		// }
 
-	xp := 0
-	export, err := exp.New(exportDir, "exp_")
-	oth.CheckPanic(err)
-	defer func() {
-		oth.CheckPanic(export.Close())
-	}()
+		exportDir := fmt.Sprintf("./downloaded_files/obj/%f-%f-%d-%d-%d", lat, lon, zoom, tryXY, tryH)
+		err = os.MkdirAll(exportDir, 0755)
+		oth.CheckPanic(err)
 
-	c3m.DisableLogs()
+		xp := 0
+		export, err := exp.New(exportDir, "exp_")
+		oth.CheckPanic(err)
+		defer func() {
+			oth.CheckPanic(export.Close())
+		}()
 
-	// semaphore settings
-	dln := 1
-	if parallel {
-		dln = 16
-	}
-	sem := make(chan int, dln)
-	var wg sync.WaitGroup
+		c3m.DisableLogs()
 
-	// exporter for decoded tiles
-	ex, exDone := make(chan c3m.C3M, dln), make(chan int)
-	go func() {
-		for tile := range ex {
-			oth.CheckPanic(export.Next(tile, fmt.Sprintf("%d", xp)))
-			xp++
+		// semaphore settings
+		dln := 1
+		if parallel {
+			dln = 16
 		}
-		exDone <- 1
-	}()
+		sem := make(chan int, dln)
+		var wg sync.WaitGroup
 
-	// Loop over the area and altitude grid. The old C3MM (style 14) octree index
-	// that used to tell us which tiles exist is no longer served by Apple, so we
-	// probe the C3M tiles (style 15) directly: a tile that has no data returns an
-	// empty body, which getTileIfPresent reports as "not present" and we skip.
-	for dx := -tryXY; dx <= tryXY; dx++ {
-		for dy := -tryXY; dy <= tryXY; dy++ {
-			for h := 0; h < int(tryH); h++ {
-				xn := x + int(dx)
-				yn := y + int(dy)
+		// exporter for decoded tiles
+		ex, exDone := make(chan c3m.C3M, dln), make(chan int)
+		go func() {
+			for tile := range ex {
+				oth.CheckPanic(export.Next(tile, fmt.Sprintf("%d", xp)))
+				xp++
+			}
+			exDone <- 1
+		}()
 
-				// async get tile
-				sem <- 1
-				wg.Add(1)
-				dx, dy, h := dx, dy, h
-				go func() {
-					defer wg.Done()
-					defer func() { <-sem }()
-					tile, found, err := ctx.getTileIfPresent(p, z, yn, xn, h)
-					if err != nil {
-						l.Println("Error at", dx, dy, "h =", h, ":", err)
-						return
-					}
-					if !found {
-						return
-					}
-					l.Println("Exporting", dx, dy, "h =", h)
-					ex <- tile
-				}()
+		// Loop over the area and altitude grid. The old C3MM (style 14) octree index
+		// that used to tell us which tiles exist is no longer served by Apple, so we
+		// probe the C3M tiles (style 15) directly: a tile that has no data returns an
+		// empty body, which getTileIfPresent reports as "not present" and we skip.
+		for dx := -tryXY; dx <= tryXY; dx++ {
+			for dy := -tryXY; dy <= tryXY; dy++ {
+				for h := 0; h < int(tryH); h++ {
+					xn := x + int(dx)
+					yn := y + int(dy)
+
+					// async get tile
+					sem <- 1
+					wg.Add(1)
+					dx, dy, h := dx, dy, h
+					go func() {
+						defer wg.Done()
+						defer func() { <-sem }()
+						tile, found, err := ctx.getTileIfPresent(p, z, yn, xn, h)
+						if err != nil {
+							l.Println("Error at", dx, dy, "h =", h, ":", err)
+							return
+						}
+						if !found {
+							return
+						}
+						l.Println("Exporting", dx, dy, "h =", h)
+						ex <- tile
+					}()
+				}
 			}
 		}
+		wg.Wait() // wait for all tile loads to finish
+		close(ex) // no more tiles sent to exporter
+		<-exDone  // wait till all tiles are exported
+		l.Println(xp, "exported")
+		if xp != 0{
+			break
+		}
 	}
-	wg.Wait() // wait for all tile loads to finish
-	close(ex) // no more tiles sent to exporter
-	<-exDone  // wait till all tiles are exported
-	l.Println(xp, "exported")
 }
 
 // getTileIfPresent fetches and parses the C3M tile at the given coordinates.
@@ -196,6 +221,7 @@ func (ctx *context) getTileIfPresent(p fly.Trigger, z, y, x, h int) (c3m.C3M, bo
 	}
 	// An empty 200 response means there is no tile at these coordinates.
 	if len(data) < 5 {
+		//fmt.Print("Empty\n")
 		return c3m.C3M{}, false, nil
 	}
 	tile, err := c3m.Parse(data)
@@ -214,7 +240,7 @@ func (ctx context) findPlace(lat, lon float64) (fly.Trigger, error) {
 	for _, v := range ctx.AltitudeManifest.Triggers {
 		dist := math.Sqrt(math.Pow(lat-v.Lat, 2) + math.Pow(lon-v.Lon, 2))
 		// radius can overlap. ignored for now
-		if dist <= v.Radius && dist < minDist {
+		if dist <= v.Radius && dist < minDist && !contains(scraped_regions_to_ignore, v.Name){
 			minDist, minPlace = dist, v
 		}
 	}
